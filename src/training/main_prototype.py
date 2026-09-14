@@ -1,103 +1,79 @@
-"""
-This will perform K-means clustering on the training data
-
-Good reference for clustering
-https://github.com/facebookresearch/faiss/wiki/FAQ#questions-about-training
-"""
-
-from __future__ import print_function
+"""Fit MMP morphology prototypes from the selected external fold's train.csv."""
+from __future__ import annotations
 
 import argparse
-import torch
-from torch.utils.data import DataLoader
-from wsi_datasets import WSIProtoDataset
-from utils.utils import seed_torch, read_splits
-from utils.file_utils import save_pkl
-from utils.proto_utils import cluster
+import json
+from pathlib import Path
 
-import os
-from os.path import join as j_
-
-def build_datasets(csv_splits, batch_size=1, num_workers=2, train_kwargs={}):
-    dataset_splits = {}
-    for k in csv_splits.keys(): # ['train']
-        df = csv_splits[k]
-        dataset_kwargs = train_kwargs.copy()
-        dataset = WSIProtoDataset(df, **dataset_kwargs)
-
-        batch_size = 1
-        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
-        dataset_splits[k] = dataloader
-        print(f'split: {k}, n: {len(dataset)}')
-
-    return dataset_splits
+from utils.experiment_config import (canonical_cancer, file_sha256, load_data_paths,
+                                     prototype_spec, resolve_protocol, validate_prototype)
 
 
 def main(args):
-    
-    train_kwargs = dict(data_source=args.data_source)
-       
+    if min(args.n_proto, args.in_dim, args.n_proto_patches, args.n_init, args.n_iter) < 1:
+        raise ValueError("Prototype dimensions, sampling and clustering settings must be positive")
+    if args.num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    paths = load_data_paths(args.data_config)
+    protocol = resolve_protocol(args.endpoint, args.split_mode, paths=paths)
+    spec = prototype_spec(protocol, args.cancer, args.fold, paths=paths,
+                          n_proto=args.n_proto, in_dim=args.in_dim, mode=args.mode,
+                          n_proto_patches=args.n_proto_patches, n_init=args.n_init,
+                          n_iter=args.n_iter, seed=args.seed)
+    metadata = spec["metadata"]
+    destination = Path(spec["path"])
+    if args.dry_run:
+        print(json.dumps(spec, indent=2))
+        return spec
+    if destination.exists():
+        validate_prototype(destination, metadata["train_csv"], metadata["feature_dir"],
+                           args.n_proto, args.in_dim, protocol["endpoint"], protocol["split_mode"])
+        print(f"Reusing validated prototype: {destination}")
+        return spec
+
+    import pandas as pd
+    import torch
+    from torch.utils.data import DataLoader
+    from wsi_datasets.wsi_prototype import WSIProtoDataset
+    from utils.proto_utils import cluster
+    from utils.utils import seed_torch
+    from utils.file_utils import save_pkl
+
     seed_torch(args.seed)
-    csv_splits = read_splits(args)
-    print('\nsuccessfully read splits for: ', list(csv_splits.keys()))
-
-    dataset_splits = build_datasets(csv_splits,
-                                    batch_size=1,
-                                    num_workers=args.num_workers,
-                                    train_kwargs=train_kwargs)
-
-    print('\nInit Datasets...', end=' ')
-    os.makedirs(j_(args.split_dir, 'prototypes'), exist_ok=True)
-
-    loader_train = dataset_splits['train']
-    
-    _, weights = cluster(loader_train,
-                            n_proto=args.n_proto,
-                            n_iter=args.n_iter,
-                            n_init=args.n_init,
-                            feature_dim=args.in_dim,
-                            mode=args.mode,
-                            n_proto_patches=args.n_proto_patches,
-                            use_cuda=True if torch.cuda.is_available() else False)
-    
-
-    save_fpath = j_(args.split_dir,
-                    'prototypes',
-                    f"prototypes_c{args.n_proto}_{args.data_source[0].split('/')[-2]}_{args.mode}_num_{args.n_proto_patches:.1e}.pkl")
-
-    save_pkl(save_fpath, {'prototypes': weights})
+    train = pd.read_csv(metadata["train_csv"])
+    dataset = WSIProtoDataset({"histo": train}, [metadata["feature_dir"]])
+    loader = DataLoader(dataset, batch_size=1, num_workers=args.num_workers, shuffle=False)
+    sampled, weights = cluster(loader, n_proto=args.n_proto, n_iter=args.n_iter,
+                               n_init=args.n_init, feature_dim=args.in_dim,
+                               n_proto_patches=args.n_proto_patches, mode=args.mode,
+                               use_cuda=torch.cuda.is_available(), seed=args.seed)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    save_pkl(str(destination), {"prototypes": weights})
+    metadata.update(prototype_sha256=file_sha256(destination), sampled_patches=sampled,
+                    training_cases=int(train.case_id.nunique()), training_slides=len(train))
+    Path(spec["metadata_path"]).write_text(json.dumps(metadata, indent=2) + "\n")
+    print(f"Saved train-only prototypes: {destination}")
+    return spec
 
 
-# Generic training settings
-parser = argparse.ArgumentParser(description='Configurations for WSI Training')
-parser.add_argument('--seed', type=int, default=1,
-                    help='random seed for reproducible experiment (default: 1)')
-# model / loss fn args ###
-parser.add_argument('--n_proto', type=int, help='Number of prototypes')
-parser.add_argument('--n_proto_patches', type=int, default=10000,
-                    help='Number of patches per prototype to use. Total patches = n_proto * n_proto_patches')
-parser.add_argument('--n_init', type=int, default=5,
-                    help='Number of different KMeans initialization (for FAISS)')
-parser.add_argument('--n_iter', type=int, default=50,
-                    help='Number of iterations for Kmeans clustering')
-parser.add_argument('--in_dim', type=int)
-parser.add_argument('--mode', type=str, choices=['kmeans', 'faiss'], default='kmeans')
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--cancer", required=True, type=canonical_cancer)
+    result.add_argument("--fold", required=True, type=int, choices=range(5))
+    result.add_argument("--endpoint", choices=["dss", "os"], default="dss")
+    result.add_argument("--split-mode", choices=["train_test", "train_val_test"], default="train_test")
+    result.add_argument("--data-config")
+    result.add_argument("--mode", choices=["faiss", "kmeans"], default="faiss")
+    result.add_argument("--n-proto", type=int, default=16)
+    result.add_argument("--in-dim", type=int, default=768)
+    result.add_argument("--n-proto-patches", type=int, default=100000)
+    result.add_argument("--n-init", type=int, default=3)
+    result.add_argument("--n-iter", type=int, default=50)
+    result.add_argument("--seed", type=int, default=1)
+    result.add_argument("--num-workers", type=int, default=2)
+    result.add_argument("--dry-run", action="store_true")
+    return result
 
-# dataset / split args ###
-parser.add_argument('--data_source', type=str, default=None,
-                    help='manually specify the data source')
-parser.add_argument('--split_dir', type=str, default=None,
-                    help='manually specify the set of splits to use')
-parser.add_argument('--split_names', type=str, default='train,val,test',
-                    help='delimited list for specifying names within each split')
-parser.add_argument('--num_workers', type=int, default=8)
-
-args = parser.parse_args()
 
 if __name__ == "__main__":
-    args.split_dir = j_('splits', args.split_dir)
-    args.split_name = os.path.basename(args.split_dir)
-    print('split_dir: ', args.split_dir)
-
-    args.data_source = [src for src in args.data_source.split(',')]
-    results = main(args)
+    main(parser().parse_args())

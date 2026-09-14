@@ -330,34 +330,74 @@ def predict_surv(self, dataset,  use_cuda=True, permute=False):
     return output, y
 
 
-def process_surv(logits, label, censorship, loss_fn=None):
+def process_surv(
+    logits,
+    label,
+    censorship,
+    loss_fn=None,
+    *,
+    survival_time=None,
+    defer_survival_loss=False,
+):
+    """Convert raw model outputs into the shared survival result contract.
+
+    Discrete NLL consumes ``label`` (the fitted time-bin index). Cox consumes
+    the continuous observed ``survival_time``. ``defer_survival_loss`` is used
+    by the memory-bounded STARPath Cox trainer: it emits log risk without
+    evaluating a meaningless one-patient partial likelihood.
+    """
     results_dict = {'logits': logits}
     log_dict = {}
 
-    if loss_fn is not None and label is not None:
-        if isinstance(loss_fn, NLLSurvLoss):
-            surv_loss_dict = loss_fn(logits=logits, times=label, censorships=censorship)
-            hazards = torch.sigmoid(logits)
-            survival = torch.cumprod(1 - hazards, dim=1)
-            risk = -torch.sum(survival, dim=1).unsqueeze(dim=1)
-            results_dict.update({'hazards': hazards,
-                                    'survival': survival,
-                                    'risk': risk})
-        elif isinstance(loss_fn, CoxLoss):
-            # logits is log risk
-            surv_loss_dict = loss_fn(logits=logits, times=label, censorships=censorship)
-            risk = torch.exp(logits)
-            results_dict['risk'] = risk
+    if isinstance(loss_fn, NLLSurvLoss):
+        if defer_survival_loss:
+            raise ValueError("defer_survival_loss is only supported for Cox loss")
+        hazards = torch.sigmoid(logits)
+        survival = torch.cumprod(1 - hazards, dim=1)
+        risk = -torch.sum(survival, dim=1, keepdim=True)
+        results_dict.update({'hazards': hazards, 'survival': survival, 'risk': risk})
+        if label is None:
+            return results_dict, log_dict
+        surv_loss_dict = loss_fn(
+            logits=logits, times=label.reshape(-1, 1),
+            censorships=censorship.reshape(-1, 1),
+        )
+    elif isinstance(loss_fn, CoxLoss):
+        # A Cox head emits log risk directly. It is monotonic with exp(logit)
+        # and is numerically safer for concordance calculations.
+        results_dict['risk'] = logits
+        if defer_survival_loss:
+            results_dict['loss'] = None
+            return results_dict, log_dict
+        # Never interpret a discretized label as continuous follow-up time.
+        cox_time = survival_time
+        if cox_time is None:
+            raise ValueError(
+                "Cox loss requires a continuous survival time endpoint"
+            )
+        surv_loss_dict = loss_fn(
+            logits=logits, times=cox_time, censorships=censorship
+        )
+    elif isinstance(loss_fn, SurvRankingLoss):
+        ranking_time = survival_time if survival_time is not None else label
+        if ranking_time is None:
+            return results_dict, log_dict
+        surv_loss_dict = loss_fn(
+            z=logits, times=ranking_time, censorships=censorship
+        )
+        results_dict['risk'] = logits
+    else:
+        return results_dict, log_dict
 
-        elif isinstance(loss_fn, SurvRankingLoss):
-                surv_loss_dict = loss_fn(z=logits, times=label, censorships=censorship)
-                results_dict['risk'] = logits
-
-        loss = surv_loss_dict['loss']
-        log_dict['surv_loss'] = surv_loss_dict['loss'].item()
-        log_dict.update(
-            {k: v.item() for k, v in surv_loss_dict.items() if isinstance(v, torch.Tensor)})
-        results_dict.update({'loss': loss})
+    loss = surv_loss_dict['loss']
+    results_dict['loss'] = loss
+    if loss is not None:
+        log_dict['surv_loss'] = float(loss.detach().item())
+        log_dict.update({
+            key: float(value.detach().item())
+            for key, value in surv_loss_dict.items()
+            if isinstance(value, torch.Tensor)
+        })
 
     return results_dict, log_dict
 

@@ -5,4 +5,13 @@
 src/results/
 .DS_Store
 .vscode
-
+results/
+artifacts/
+*.py[cod]
+.pytest_cache/
+src/mil_models/TITAN/*.safetensors
+src/mil_models/TITAN_STARPath/*.safetensors
+src/mil_models/TITAN/*.pkl
+src/mil_models/TITAN_STARPath/*.pkl
+src/mil_models/TITAN/*.bin
+src/mil_models/TITAN_STARPath/*.bin

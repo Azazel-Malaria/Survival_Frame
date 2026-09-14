@@ -42,17 +42,17 @@ def safe_list_to(data, device):
 
     if isinstance(data, torch.Tensor):
         return data.to(device)
-    elif isinstance(data, tuple):
-        return (d.to(device) for d in data)
-    elif isinstance(data, list):
-        return [d.to(device) for d in data]
-    elif isinstance(data, dict):
-        return {k: v.to(device) for (k, v) in data.keys()}
-    elif isinstance(data, torch_geometric.data.Batch):
-        return data.to(device)
-    else:
-        raise RuntimeError("data should be a Tensor, tuple, list or dict, but"
-                           " not {}".format(type(data)))
+    if isinstance(data, tuple):
+        return tuple(safe_list_to(value, device) for value in data)
+    if isinstance(data, list):
+        return [safe_list_to(value, device) for value in data]
+    if isinstance(data, dict):
+        return {key: safe_list_to(value, device) for key, value in data.items()}
+
+    # Batch dictionaries also contain strings, paths, IDs, numeric metadata,
+    # and optional values. They do not have a device and must pass through
+    # unchanged while tensors nested alongside them are moved recursively.
+    return data
 
 def get_current_time():
     now = datetime.datetime.now()
@@ -150,20 +150,27 @@ def seed_torch(seed=7):
 
 
 def read_splits(args, fold_idx=None):
-    splits_csvs = {}
+    """Read a fixed cohort and check separation before fitting any transform."""
     split_names = args.split_names.split(',')
-    print(f"Using the following split names: {split_names}")
+    if not split_names or len(set(split_names)) != len(split_names):
+        raise ValueError('Split names must be a nonempty unique list')
+    gene = None
+    if bool(getattr(args, 'requires_omics', False)):
+        if not args.omics_path:
+            raise ValueError('An explicit RNA path is required for this model')
+        gene = _read_gene(args.omics_path, None)
+    result = {name: {'histo': _read_histo(args.split_dir, name, fold_idx), 'gene': gene}
+              for name in split_names}
+    for i, name in enumerate(split_names):
+        for other in split_names[i + 1:]:
+            for key in ('case_id', 'slide_id', 'tissue_source_site'):
+                left, right = result[name]['histo'], result[other]['histo']
+                if key in left and key in right:
+                    overlap = set(left[key].dropna()) & set(right[key].dropna())
+                    if overlap:
+                        raise ValueError(f'{key} overlap between {name}/{other}: {sorted(overlap)[:5]}')
+    return result
 
-    for split in split_names:
-        splits_csvs[split] = {}
-        splits_csvs[split]['histo'] = _read_histo(args.split_dir, split, fold_idx)
-
-        if 'omics_dir' in args:
-            splits_csvs[split]['gene'] = _read_gene(args.omics_dir, split)
-        else:
-            splits_csvs[split]['gene'] = None
-
-    return splits_csvs
 
 def _read_histo(split_dir, split, fold_idx):
     if fold_idx is not None:
@@ -171,23 +178,122 @@ def _read_histo(split_dir, split, fold_idx):
     else:
         split_path = j_(split_dir, f'{split}.csv')
 
-    if os.path.isfile(split_path):
-        df = pd.read_csv(split_path)
-        assert 'Unnamed: 0' not in df.columns
+    if not os.path.isfile(split_path):
+        fold_description = (
+            '' if fold_idx is None else f' for fold {fold_idx}'
+        )
+        raise FileNotFoundError(
+            f"Split CSV {split!r}{fold_description} does not exist: "
+            f"{split_path}"
+        )
+    df = pd.read_csv(split_path)
+    assert 'Unnamed: 0' not in df.columns
     return df
 
-def _read_gene(omics_dir, split):
-    split_path = j_(omics_dir, 'rna_clean.csv')
-    if os.path.isfile(split_path):
-        df = pd.read_csv(split_path, engine='python', index_col=0)
-        assert 'Unnamed: 0' not in df.columns
+def _read_gene(omics_source, split):
+    """Read patient-by-gene or gene-by-patient TCGA RNA as case-by-gene."""
+    del split  # RNA files are shared across folds/splits.
 
-        df = df.reset_index()
-        df = df.rename(columns={'index': 'case_id'})
-    else:
+    omics_source = os.fspath(omics_source)
+    split_path = (
+        j_(omics_source, 'rna_clean.csv')
+        if os.path.isdir(omics_source)
+        else omics_source
+    )
+    if not os.path.isfile(split_path):
         raise FileNotFoundError(f"{split_path} not found!")
 
+    df = pd.read_csv(split_path)
+    if df.empty:
+        raise ValueError(f"RNA table is empty: {split_path}")
+
+    tcga_pattern = r'^TCGA-[A-Za-z0-9]{2}-[A-Za-z0-9]{4}'
+    unnamed_cols = [col for col in df.columns if str(col).startswith('Unnamed:')]
+
+    # Patient-by-gene inputs use an explicit ID column or a CSV index column
+    # populated by TCGA sample/case IDs.
+    id_col = None
+    if 'case_id' in df.columns:
+        id_col = 'case_id'
+    elif 'sample' in df.columns:
+        id_col = 'sample'
+    else:
+        tcga_id_cols = [
+            col for col in unnamed_cols
+            if df[col].notna().all()
+            and df[col].astype(str).str.match(tcga_pattern).all()
+        ]
+        if len(tcga_id_cols) == 1:
+            id_col = tcga_id_cols[0]
+
+    if id_col is not None:
+        source_ids = df[id_col].astype(str)
+        drop_columns = list(unnamed_cols)
+        for metadata_col in ('sample', 'case_id'):
+            if metadata_col not in drop_columns:
+                drop_columns.append(metadata_col)
+        df = df.drop(columns=drop_columns, errors='ignore').copy()
+    else:
+        # SlotSPE stores genes in rows and TCGA patients in columns. Preserve
+        # its row order so that it becomes the feature-column order after the
+        # transpose.
+        patient_cols = [
+            col for col in df.columns
+            if bool(re.match(tcga_pattern, str(col)))
+        ]
+        non_patient_cols = [col for col in df.columns if col not in patient_cols]
+        if not patient_cols or len(non_patient_cols) != 1:
+            raise ValueError(
+                f"Cannot determine RNA orientation in {split_path}; expected "
+                "a patient ID column or one gene column followed by TCGA "
+                "patient columns."
+            )
+
+        gene_col = non_patient_cols[0]
+        if df[gene_col].isna().any():
+            raise ValueError(f"Empty gene names found in {split_path}")
+        gene_names = df[gene_col].astype(str).str.strip()
+        if gene_names.eq('').any():
+            raise ValueError(f"Empty gene names found in {split_path}")
+
+        df = df.set_index(gene_col)[patient_cols].transpose(copy=True)
+        # Transpose preserves the source row order as the output gene order.
+        df.columns = gene_names.to_list()
+        source_ids = pd.Series(df.index.astype(str), index=df.index)
+        df = df.reset_index(drop=True)
+
+    case_ids = source_ids.astype(str).str.extract(
+        r'^(TCGA-[A-Za-z0-9]{2}-[A-Za-z0-9]{4})', expand=False
+    )
+    if case_ids.isna().any():
+        raise ValueError(f"Malformed TCGA IDs found in {split_path}")
+
+    df.insert(0, 'case_id', case_ids.to_numpy())
+
+    # Prefer primary tumour RNA when multiple samples map to one case.
+    sample_type = pd.to_numeric(source_ids.astype(str).str[13:15], errors='coerce')
+    df['_sample_rank'] = np.select(
+        [sample_type.eq(1).to_numpy(), sample_type.between(1, 9).to_numpy()],
+        [0, 1],
+        default=2
+    )
+    df['_row_order'] = np.arange(len(df))
+    df = (df.sort_values(['case_id', '_sample_rank', '_row_order'], kind='stable')
+            .drop_duplicates('case_id', keep='first')
+            .drop(columns=['_sample_rank', '_row_order'])
+            .reset_index(drop=True))
+
+    non_numeric = [
+        col for col in df.columns
+        if col != 'case_id' and not pd.api.types.is_numeric_dtype(df[col])
+    ]
+    if non_numeric:
+        raise ValueError(
+            f"Non-numeric RNA feature columns in {split_path}: {non_numeric[:5]}"
+        )
+
     return df
+
 
 
 class AverageMeter(object):
@@ -224,7 +330,7 @@ def get_lr_scheduler(args, optimizer, dataloader):
     if warmup_steps > 0:
         warmup_steps = warmup_steps
     elif warmup_epochs > 0:
-        warmup_steps = warmup_epochs * (len(dataloader) // accum_steps)
+        warmup_steps = warmup_epochs * math.ceil(len(dataloader) / accum_steps)
     else:
         warmup_steps = 0
     if scheduler_name=='constant':
@@ -233,13 +339,13 @@ def get_lr_scheduler(args, optimizer, dataloader):
     elif scheduler_name=='cosine':
         lr_scheduler = get_cosine_schedule_with_warmup(optimizer=optimizer,
         num_warmup_steps=warmup_steps,
-        num_training_steps=(len(dataloader) // accum_steps * epochs),
+        num_training_steps=(math.ceil(len(dataloader) / accum_steps) * epochs),
         )
     elif scheduler_name=='linear':
         lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
-        num_training_steps=(len(dataloader) // accum_steps) * epochs,
+        num_training_steps=math.ceil(len(dataloader) / accum_steps) * epochs,
         )
     return lr_scheduler
 
@@ -263,6 +369,8 @@ def get_optim(args, model=None, parameters=None):
 
     if args.opt == "adamW":
         optimizer = optim.AdamW(parameters, lr=args.lr)
+    elif args.opt == 'adam':
+        optimizer = optim.Adam(parameters, lr=args.lr)
     elif args.opt == 'sgd':
         optimizer = optim.SGD(parameters, lr=args.lr, momentum=0.9)
     elif args.opt == 'RAdam':
@@ -289,74 +397,3 @@ def print_network(net):
 
     # print('Total number of parameters: %d' % num_params)
     # print('Total number of trainable parameters: %d' % num_params_train)
-
-
-class EarlyStopping:
-    """Early stops the training if validation loss doesn't improve after a given patience."""
-
-    def __init__(self, save_dir, patience=20, min_stop_epoch=50, verbose=False, better='min'):
-        """
-        train_args:
-            patience (int): How long to wait after last time validation loss improved.
-                            Default: 20
-            min_stop_epoch (int): Earliest epoch possible for stopping
-            verbose (bool): If True, prints a message for each validation loss improvement. 
-                            Default: False
-        """
-        self.patience = patience
-        self.patience_counter = 0
-        self.min_stop_epoch = min_stop_epoch
-        self.better = better
-        self.verbose = verbose
-        self.best_score = None
-        self.save_dir = save_dir
-
-        if better == 'min':
-            self.best_score = np.Inf
-        else:
-            self.best_score = -np.Inf
-        self.early_stop = False
-        self.counter = 0
-
-    def is_new_score_better(self, score):
-        if self.better == 'min':
-            return score < self.best_score
-        else:
-            return score > self.best_score
-
-    def __call__(self, epoch, score, save_ckpt_fn, save_ckpt_kwargs):
-        is_better = self.is_new_score_better(score)
-        if is_better:
-            print(
-                f'score improved ({self.best_score:.6f} --> {score:.6f}).  Saving model ...')
-            self.save_checkpoint(save_ckpt_fn, save_ckpt_kwargs)
-            self.counter = 0
-            self.best_score = score
-        else:
-            self.counter += 1
-            print(
-                f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience and epoch >= (self.min_stop_epoch - 1):
-                self.early_stop = True
-        return self.early_stop
-
-    def save_checkpoint(self, save_ckpt_fn, save_ckpt_kwargs):
-        '''Saves model when score improves.'''
-        if 'save_dir' in save_ckpt_kwargs:
-            save_ckpt_fn(**save_ckpt_kwargs)
-        else:
-            save_ckpt_fn(save_dir=self.save_dir, **save_ckpt_kwargs)
-
-
-def save_checkpoint(config, epoch, model, score, save_dir, fname=None):
-    save_state = {'model': model.state_dict(),
-                  'score': score,
-                  'epoch': epoch,
-                  'config': config}
-
-    if fname is None:
-        save_path = j_(save_dir, f'ckpt_epoch_{epoch}.pth')
-    else:
-        save_path = j_(save_dir, fname)
-
-    torch.save(save_state, save_path)

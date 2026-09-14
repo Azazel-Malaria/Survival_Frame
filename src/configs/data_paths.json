@@ -1,0 +1,15 @@
+{
+  "rna_root": "/data2/lama/self_unify_RNA",
+  "feature_root": "/data2/lama/features_conch_v15",
+  "st_root": "/data2/lama/ST_pred",
+  "split_roots": {
+    "dss/train_test": "/data2/lama/SPILT_DSS_test/src/splits/survival",
+    "dss/train_val_test": "/data2/lama/SPILT_DSS_val_test/src/splits/survival",
+    "os/train_test": "/data2/lama/SPILT_OS_test/src/splits/survival",
+    "os/train_val_test": "/data2/lama/SPILT_OS_val_test/src/splits/survival"
+  },
+  "prototype_root": "artifacts/prototypes",
+  "results_root": "results",
+  "titan_root": "src/mil_models/TITAN",
+  "starpath_titan_root": "src/mil_models/TITAN_STARPath"
+}

@@ -107,41 +107,91 @@ def nll_loss(logits, y, c, alpha=0.0, eps=1e-7, reduction='mean'):
     return {'loss': loss, 'uncensored_loss': uncensored_loss, 'censored_loss': censored_loss}
 
 def partial_ll_loss(lrisks, survival_times, event_indicators):
+    """Negative Cox partial log likelihood with Breslow tie handling.
+
+    ``survival_times`` must contain the observed continuous event/censoring
+    times, not discrete NLL bin labels. For every unique event time, Breslow's
+    approximation uses one denominator containing every patient still in the
+    risk set, including censored patients recorded at the same time.
     """
-    lrisks: log risks, B x 1
-    survival_times: time bin, B x 1
-    event_indicators: event indicator, B x 1
-    """    
-    num_uncensored = torch.sum(event_indicators, 0)
-    if num_uncensored.item() == 0:
-        return {'loss': torch.sum(lrisks) * 0}
-    
-    survival_times = survival_times.squeeze(1)
-    event_indicators = event_indicators.squeeze(1)
-    lrisks = lrisks.squeeze(1)
+    if not torch.is_tensor(lrisks):
+        raise TypeError("lrisks must be a torch.Tensor")
 
-    sindex = torch.argsort(-survival_times)
-    survival_times = survival_times[sindex]
-    event_indicators = event_indicators[sindex]
-    lrisks = lrisks[sindex]
+    log_risks = lrisks.reshape(-1)
+    times = torch.as_tensor(
+        survival_times, device=log_risks.device
+    ).reshape(-1)
+    events = torch.as_tensor(
+        event_indicators, device=log_risks.device
+    ).reshape(-1)
+    if log_risks.numel() == 0:
+        raise ValueError("Cox loss requires at least one patient")
+    if times.numel() != log_risks.numel() or events.numel() != log_risks.numel():
+        raise ValueError(
+            "Cox logits, survival times, and event indicators must have the "
+            "same number of patients"
+        )
+    if not torch.is_floating_point(log_risks):
+        raise TypeError("Cox log risks must use a floating-point dtype")
+    if not bool(torch.isfinite(log_risks).all().item()):
+        raise ValueError("Cox log risks contain NaN or Inf")
+    if not bool(torch.isfinite(times).all().item()):
+        raise ValueError("Cox survival times contain NaN or Inf")
+    if not bool(((events == 0) | (events == 1)).all().item()):
+        raise ValueError("Cox event indicators must be binary")
 
-    log_risk_stable = torch.logcumsumexp(lrisks, 0)
+    events = events.to(dtype=log_risks.dtype)
+    num_events = events.sum()
+    if bool((num_events == 0).item()):
+        # Keep the zero connected to the logits so callers can safely invoke
+        # backward on an all-censored risk set.
+        return {'loss': log_risks.sum() * 0.0}
 
-    likelihood = lrisks - log_risk_stable
-    uncensored_likelihood = likelihood * event_indicators
-    logL = -torch.sum(uncensored_likelihood)
-    # negative average log-likelihood
-    return {'loss': logL / num_uncensored}
+    # Descending time makes logcumsumexp[i] the denominator for the patient at
+    # i. For a tied group the denominator must be taken at the group's final
+    # position so every patient at that time is included exactly once.
+    order = torch.argsort(times, descending=True, stable=True)
+    sorted_times = times[order]
+    sorted_log_risks = log_risks[order]
+    sorted_events = events[order]
+    log_cumulative_risk = torch.logcumsumexp(sorted_log_risks, dim=0)
+
+    _, group_counts = torch.unique_consecutive(sorted_times, return_counts=True)
+    group_ends = torch.cumsum(group_counts, dim=0) - 1
+    group_ids = torch.repeat_interleave(
+        torch.arange(group_counts.numel(), device=log_risks.device),
+        group_counts,
+    )
+    event_counts = torch.zeros(
+        group_counts.numel(), device=log_risks.device, dtype=log_risks.dtype
+    )
+    event_log_risk_sums = torch.zeros_like(event_counts)
+    event_counts.scatter_add_(0, group_ids, sorted_events)
+    event_log_risk_sums.scatter_add_(
+        0, group_ids, sorted_log_risks * sorted_events
+    )
+
+    log_likelihood = (
+        event_log_risk_sums
+        - event_counts * log_cumulative_risk[group_ends]
+    ).sum()
+    return {'loss': -log_likelihood / num_events}
 
 
 class CoxLoss(nn.Module):
-    """
-    """
+    """Mean negative Cox partial log likelihood (Breslow ties)."""
     def __init__(self):
         super().__init__()
 
-    def __call__(self, logits, times, censorships):
-        return partial_ll_loss(lrisks = logits, survival_times=times, event_indicators=(1-censorships).float())
+    def forward(self, logits, times, censorships):
+        censorships = torch.as_tensor(censorships, device=logits.device)
+        if not bool(((censorships == 0) | (censorships == 1)).all().item()):
+            raise ValueError("Cox censorship indicators must be binary")
+        return partial_ll_loss(
+            lrisks=logits,
+            survival_times=times,
+            event_indicators=1.0 - censorships.to(dtype=logits.dtype),
+        )
 
 
 class SurvRankingLoss(nn.Module):

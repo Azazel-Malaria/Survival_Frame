@@ -1,151 +1,164 @@
-# MMP
+# STARPath
 
+基于官方 [MMP](https://github.com/mahmoodlab/MMP) 整理的生存预测实验框架，包含 STARPath、MMP、DIMAF、SlotSPE、SurvPath 和单模态基线。STARPath 主干集中在 [modal_starpath.py](src/mil_models/modal_starpath.py)，保留完整的 coarse、route atlas 与动态 TITAN memory 交互。
 
-  <b>Multimodal Prototyping for cancer survival prediction</b>, ICML 2024.
-	<br><em>Andrew H. Song, Richard J. Chen, Guillaume Jaume, Anurag Vaidya, Alexander S. Baras, Faisal Mahmood</em></br>
+支持 **BRCA、BLCA、STAD、HNSC、LUAD、LUSC、CRC、KIRC**。CRC 对应 RNA 和 split 中的 COADREAD；启动脚本统一使用 CRC。
 
-<img src="docs/mmp_logo.png" width="230px" align="right" />
+## 默认协议
 
-[Paper](https://openreview.net/pdf?id=3MfvxH3Gia) | [Cite](#cite)
+| 设置 | 默认值 |
+|---|---|
+| 生存终点 / 划分 | DSS / `train_test`，读取 `SPILT_DSS_test` |
+| 主损失 | NLL；所有模型也可选 Cox |
+| NLL batch size | 1；**DIMAF 默认 64** |
+| Cox batch size | 默认目标 64 位患者；末尾风险集按患者总数调整 |
+| Checkpoint | `last`，实际训练结束的最后一个 epoch |
+| Early stopping | 关闭；与 checkpoint 选择独立 |
+| 训练轮数 / 学习率 / 随机种子 | 10 / `1e-4` / 1 |
+| 交叉验证 | 5 折，编号 0–4 |
+| STARPath 注入层 / 可训练层 | `2,4` / `2,3,4,5`，从 0 开始编号 |
+| STARPath 每张切片 patch 上限 | 512；完整 morphology 和 atlas 在抽样前计算 |
 
-**Abstract:** Multimodal survival methods combining gigapixel histology whole-slide images (WSIs) and
-transcriptomic profiles are particularly promising for patient prognostication and stratification.
-Current approaches involve tokenizing the WSIs into smaller patches (> 10k patches) and transcriptomics into gene groups, which are then integrated using a Transformer for predicting outcomes. However, this process generates many
-tokens, which leads to high memory requirements for computing attention and complicates post-hoc interpretability analyses. Instead, we hypothesize that we can: (1) effectively summarize the morphological content of a WSI by
-condensing its constituting tokens using morphological prototypes, achieving more than 300× compression; and (2) accurately characterize cellular functions by encoding the transcriptomic profile with biological pathway prototypes, all
-in an unsupervised fashion. 
+`--batch-size` 可覆盖模型支持的默认值，但 **STARPath、ABMIL、TransMIL、MCAT、SurvPath、SlotSPE 的 NLL 必须使用 batch=1**；可通过 `accum_steps` 做梯度累积增大有效批量。DIMAF 的 NLL 默认是真正的 batch=64，Cox 也默认 64。本工程统一 NLL 使用 mean，并保留 DIMAF 独立的 distance-correlation 辅助项；与官方纯 NLL 协议的区别见 [模型来源](docs/model_provenance.md)。
 
-We introduce **M**ulti**M**odal **P**rototyping framework (**MMP**), where the resulting multimodal tokens are then processed by a fusion network, either with a Transformer or an optimal transport cross-alignment, which now operates with a small and fixed number of tokens without approximations. Extensive evaluation shows that our framework outperforms state-of-the-art methods with much less computation while unlocking new interpretability analyses.
+所有模型的 Cox 训练都使用 `EventAwareRiskSetBatchSampler`，为风险集安排可比较的事件患者，并将单患者尾批与前一批重组；每位患者每轮恰好出现一次，不丢弃或重复患者。上述单患者 WSI 模型使用逻辑风险集：先逐患者 forward 汇总风险并计算 Cox 梯度，再恢复 RNG 逐患者第二次 forward/backward。普通 NLL 梯度累积不代替 Cox 风险集。
 
-**MMP** (a.k.a. **M**ulti**M**odal **P**anther) is a multimodal extension of our companion work **PANTHER** (*CVPR 2024*, [paper](https://openaccess.thecvf.com/content/CVPR2024/html/Song_Morphological_Prototyping_for_Unsupervised_Slide_Representation_Learning_in_Computational_Pathology_CVPR_2024_paper.html), [code](https://github.com/mahmoodlab/PANTHER)), so we encourage you to check it out!
+## 数据和原型
 
-<img src="docs/fig1.jpg" width="1400px" align="center" />
+根目录集中在 [src/configs/data_paths.json](src/configs/data_paths.json)。RNA 默认使用 `/data2/lama/self_unify_RNA`，模型保持既有 recipe：
 
-## Updates
-- **02/20/2025**: You can also use [TRIDENT](https://github.com/mahmoodlab/TRIDENT) to extract patch features for MMP. 
-- **07/02/2024**: The first version of MMP codebase is now live!
+| 模型 | RNA |
+|---|---|
+| MMP-trans、MMP-OT、SurvPath、DIMAF | `mmp_set/hallmarks` |
+| STARPath | 默认 `mmp_set/hallmarks`；可显式选择 `--rna-set surv_set` 使用其 hallmarks |
+| MCAT、MLP、SNN、S-MLP | `surv_set/raw_rna_data/combine` |
+| SlotSPE | `slotspe` |
+| ABMIL、TransMIL、TITAN | 不使用 RNA |
 
-## Installation
-Once you clone the repo, please run the following command to create MMP conda environment.
-```shell
-conda env create -f env.yaml
-```
+| `--endpoint` | `--split-mode` | 数据根目录 |
+|---|---|---|
+| `dss` | `train_test` | `/data2/lama/SPILT_DSS_test` |
+| `dss` | `train_val_test` | `/data2/lama/SPILT_DSS_val_test` |
+| `os` | `train_test` | `/data2/lama/SPILT_OS_test` |
+| `os` | `train_val_test` | `/data2/lama/SPILT_OS_val_test` |
 
-## MMP Walkthrough
-MMP can largely be broken down into the following steps:
+实际读取各根下的 `src/splits/survival/TCGA_<COHORT>_overall_survival_k=<fold>/`。终点由配置决定；OS 同时切换 split 根和标签列。
 
-**Step 0**: Dataset organization for histology patch features\
-**Step 1**: Construct histology prototypes (across the specific cancer cohort) and aggregate tissue patch tokens to the each prototype for each patient.\
-**Step 2**: Construct pathway prototypes and aggregate transcriptomic expression tokens to each prototype for each patient.\
-**Step 3**: Fuse aggegated histology and pathway embeddings and perform downstream task.\
-**Step 4**: Visualization.
+MMP-trans、MMP-OT、DIMAF、STARPath 需要形态原型。按照官方 MMP 聚类协议，**只使用当前 endpoint、当前划分、当前折的 train.csv**；val 不参加拟合，也不自动复用同名旧 split 的原型。原型保存在 `artifacts/prototypes/<endpoint>/<split-mode>/<cancer>/fold_<k>/<fingerprint>/`，使用时校验训练名单和文件指纹。
 
-### Step 0. Dataset organization
-**Data csv**: The data csv files (with appropriate splits, e.g., train, test) are placed within `src/splits` with appropriate folder structure. For example, for classification task on ebrains, we would have
+## 启动实验
+
+以下命令从仓库根执行。当前机器的 shell 脚本默认使用 `/data2/lama/miniconda3/envs/MIL/bin/python`；其他环境可设置 `PYTHON_BIN`。环境定义见 [env.yaml](env.yaml)。`--dry-run` 展示最终配置和命令，不开始训练或聚类。
+
 ```bash
-splits/
-	├── ebrains
-    		├── train.csv
-    		├── val.csv
-    		└── test.csv
+cd /data2/lama/STARPath
+bash src/scripts/prototype/cancer.sh BRCA --dry-run
+bash src/scripts/survival/BRCA/starpath.sh --dry-run
 ```
 
-Alternatively, for 5-fold cross-validation survival task on TCGA BRCA, we would have
+准备默认 DSS train/test 原型，然后运行 STARPath 五折：
+
 ```bash
-splits/
-	├── TCGA_BRCA_survival_k=0
-    		├── train.csv
-    		├── val.csv
-    		└── test.csv
-	├── ...
-
-        ├── TCGA_BRCA_survival_k=4
-    		├── train.csv
-    		├── val.csv
-    		└── test.csv
+bash src/scripts/prototype/cancer.sh BRCA
+bash src/scripts/survival/BRCA/starpath.sh
 ```
 
-**Patch features**: For the following steps, we assume that features for each patch have already been extracted and that each WSI is represented as a set of patch features. For examples of patch feature extraction, please refer to [CLAM](https://github.com/mahmoodlab/CLAM). 
+一次构建 DSS/OS × train-test/train-val-test × 八癌种 × 五折的全部 160 份原型：
 
-The code assumes that the features are either in `.h5` or `.pt` formats - the feature directory path `FEAT_DIR` has to end with the directory `feats_h5/` if the features are in `.h5` format, and `feats_pt/` for `.pt` format.
-
-While there is no de facto standard, one good practice of organizing features are as follows (used as examples in [clustering](src/scripts/prototype/clustering.sh) and [mmp](src/scripts/survival/mmp.sh))
+```bash
+python tools/build_prototype_matrix.py --gpu 5 --jobs 4
 ```
-/path_to_data_folder/tcga_brca/extracted_mag20x_patch256_fp/extracted-vit_large_patch16_224.dinov2.uni_mass100k/feats_h5
+
+`--gpu` 指定可用 GPU，`--jobs` 是并发构建数；合格原型自动复用。每折日志和批量进度保存在 `artifacts/prototypes/build_runs/`，全部核验通过后生成 `index.csv` 和 `index.json`。当前生存流程不使用本仓库的 `src/splits`，该目录仅供保留的原 MMP embedding 示例使用。
+
+每个癌种都有以下 13 个模型脚本：`starpath.sh`、`mmp_trans.sh`、`mmp_ot.sh`、`dimaf.sh`、`slotspe.sh`、`survpath.sh`、`abmil.sh`、`transmil.sh`、`mcat.sh`、`mlp.sh`、`snn.sh`、`s_mlp.sh`、`titan.sh`。例如：
+
+```bash
+bash src/scripts/prototype/cancer.sh LUSC
+bash src/scripts/survival/LUSC/dimaf.sh --loss nll
+bash src/scripts/survival/CRC/slotspe.sh --loss cox --batch-size 64
 ```
-which specifies *magnification*, *patch size*, and *feature extractor* used to create the patch features. 
 
-### Step 1. Histology prototype construction
-For prototype construction, we use K-means clustering across all training WSIs. We recommend using GPU-based FAISS when using large number of patch features for clustering. For example, we can use the following command to find 16 prototypes (of 1,024 dimension each) using FAISS from WSIs corresponding to `SPLIT_DIR/train.csv`.
-```shell
-CUDA_VISIBLE_DEVICES=0 python -m training.main_prototype \
---mode faiss \
---data_source FEAT_DIR_1,FEAT_DIR_2 \
---split_dir SPLIT_DIR \
---split_names train \
---in_dim 1024 \
---n_proto_patches 1000000 \
---n_proto 16 \
---n_init 5 \
---seed 1 \
---num_workers 10 \
+若原型构建使用 `--mode kmeans`，训练时须匹配 `--prototype-mode kmeans`；其他原型参数也应一致。
+
+使用 OS、验证集、early stopping，并选择验证集 C-index 最好的 checkpoint：
+
+```bash
+bash src/scripts/prototype/cancer.sh BRCA --endpoint os --split-mode train_val_test
+bash src/scripts/survival/BRCA/starpath.sh \
+  --endpoint os --early-stopping 1 --checkpoint best \
+  --checkpoint-metric c_index --es-metric loss --es-patience 5 --max-epochs 30
 ```
-The list of parameters is as follows:
-- `mode`: 'faiss' uses GPU-enabled K-means clustering to find the prototypes. 'kmeans' uses sklearn K-means clustering on CPU ('faiss' or 'kmeans').
-- `data_source`: comma-separated list of feature directories ending with either `feats_h5` or `feats_p5`. Example of a feature dictory is provided in **Step 0**.
-- `split_names`: Which data split to perform clustering/prototyping on. By default `train` is the best (Since train split has the most data.) 
-- `in_dim`: Dimension of the patch features, dependent on the feature encoder.
-- `n_proto`: Number of prototypes.
-- `n_proto_patches`: Number of patch features to use per prototype. In total, `n_proto * n_proto_patches` features are used for finding prototypes.
-- `n_init`: Number of K-means initializations to try.
 
-The prototypes will be saved in the `SPLIT_DIR/prototypes` folder.
+开启 early stopping 或选择 `best` 都会强制使用对应的 `train_val_test` 划分。**early stopping 决定何时停止，不自动改变 checkpoint 选择**：`--early-stopping 1 --checkpoint last` 评估实际停止时的最后一轮；`--early-stopping 0 --checkpoint best` 训练到设定轮数，再加载验证集最优轮。也可显式指定 `--split-mode train_val_test`，保留 `last` 并关闭 early stopping。test 不参与选轮或早停。
 
+修改 STARPath 注入层和可训练层：
 
-A concrete script example of using TCGA-BRCA patch features can be found below. 
-```shell
-cd src
-./scripts/prototype/brca.sh 0
+```bash
+bash src/scripts/survival/BRCA/starpath.sh \
+  --inject-layers 1,2,4 --trainable-layers 1,2,3,4,5
+bash src/scripts/survival/BRCA/starpath.sh \
+  --inject-layers 2 --trainable-layers none
 ```
-This will initiate the script `scripts/prototype/clustering.sh` for K-means clustering. Detailed explanations for clustering hyperparameters can be found in **clustering.sh**. 
 
-### Step 2. Pathway prototype construction
-First, we need to download the pancancer-normalized TCGA transcriptomics expression data from Xena database.\
-Next, using **hallmark oncogene sets** (located in `src/data_csvs/rna/metadata/hallmarks_signatures.csv`), we filter the genes that are subset of hallmark pathways. Note that MMP can be extended to other pathways as well.
-Detailed instructions can be found in the [notebook](src/preprocess_pancancer_TCGA_normalized_RNA.ipynb).
+动态 memory 在**最后一次注入的前一个 block**结束后写回一次：默认 `2,4` 在 block 3 写回；`2` 在 block 1 写回；`1,2,4` 仍在 block 3 写回。单独指定 `0` 没有前置 block，会报错。可训练层独立选择，`none` 表示冻结全部 TITAN 权重。
 
-### Step 3. Multimodal Fusion
-We can run a downstream task as follows (The data splits for TCGA cohorts used in our study can be found in `src/splits/survival`)
-```shell
-cd src
-./scripts/survival/brca_surv.sh 0 mmp
-``` 
-where [mmp](src/scripts/survival/mmp.sh) is a bash script that contains argument examples.
+统一 Python 入口是 [tools/run_survival.py](tools/run_survival.py)，例如在已激活环境中执行 `python tools/run_survival.py --cancer BRCA --model starpath --dry-run`。模型专用参数可通过 `--` 传入底层训练入口；例如关闭 DIMAF 的解耦辅助项：
 
+```bash
+bash src/scripts/survival/BRCA/dimaf.sh --loss nll -- --dimaf_disentanglement_weight 0
+```
 
+STARPath 的 NLL 保持每次一位患者，累积 8 次再更新参数：
 
-MMP currently supports 
-- **Prototype-based multimodal fusion**: Two possible approaches. `model_mm_type=coattn` (Transformer-based full-attention) or `model_mm_type=coattn_mot` (OT-based cross-attention). 
-  - For histology aggregation approach, you can specify PANTHER or OT (`model_histo_type=PANTHER,default` or `model_histo_type=OT,default`)
-- **SurvPath**: Adapted from [SurvPath](https://github.com/mahmoodlab/SurvPath). Specify `model_mm_type=survpath` and `model_histo_type=mil,default`.
-  - Example script available in [survpath](src/scripts/survival/survpath.sh).
-- **Unimodal prototype baselines**: Use either `model_mm_type=histo` (histology prototypes only) or `model_mm_type=gene` (pathway prototypes only).
+```bash
+bash src/scripts/survival/BRCA/starpath.sh --loss nll --batch-size 1 -- --accum_steps 8
+```
 
+脚本环境变量也可直接调整，如 `LOSS_FN`、`BATCH_SIZE`、`SURVIVAL_ENDPOINT`、`CHECKPOINT_SELECTION`、`EARLY_STOPPING`、`MAX_EPOCHS`、`FOLDS`；显式 CLI 选项优先。`--folds 0` 只运行一折；`--data-config <json>` 选择另一份完整路径配置。
 
+## 结果与目录
 
-### Step 4. Visualization
+结果按协议、癌种、模型、配置指纹和本次 run 分隔，例如：
 
-The instructions for visualizations of prototype assignment map and histology => pathway & pathway => histology interactions are explained in the [notebook](src/visualization/mmp_visualization.ipynb). Currently only `model_mm_type=coattn` is supported.
+```text
+results/DSS_standard_test/BRCA/STARPath/nll_bs1_last_<config-id>/<run-id>/
+  config.json
+  run_manifest.json
+  fold_0/summary.csv
+  fold_0/history.jsonl
+  fold_0/last_checkpoint.pth
+  fold_0/checkpoint_selection.json
+  ...
+  cv_summary.csv
+  cv_summary.json
+```
 
-<img src='docs/heatmap.png' width="1400px" align="center"/>
+有验证集时另存 `best_checkpoint.pth`。`cv_summary.csv` 包含本次各折 C-index、均值和**样本标准差（ddof=1）**；单折标准差留空。仅汇总本次明确请求且全部成功的折，`cv_summary.json` 标明是否完成五折，历史结果不会混入新汇总。
 
-## MMP future directions
-As emphasized in the paper, multimodal survival analysis is a challenging clinical task that has seen significant interest in the biomedical,  computer vision, and machine learning communities. Though multimodal integration generally outperforms unimodal baselines, we note that the development of better unimodal baselines may (or may not) close the performance gap for certain cancer types, which is an area of further exploration.
+| 位置 | 用途 |
+|---|---|
+| `src/mil_models/modal_starpath.py` | STARPath 主干、共享形态统计、患者聚合 |
+| `src/mil_models/TITAN/` | 普通 TITAN 编码器、独立本地资源与预计算 embedding |
+| `src/mil_models/TITAN_STARPath/` | STARPath 专用 callback 编码器及独立资源 |
+| `src/mil_models/model_factory.py`、`survival_adapter.py` | 模型创建与公共生存损失接口 |
+| `src/wsi_datasets/`、`src/training/` | 数据对齐、归一化、采样和训练 |
+| `src/scripts/`、`tools/` | 八癌种入口、原型构建与审计 |
+| `tests/models/`、`tests/data/`、`tests/training/`、`tests/scripts/` | 行为与协议测试 |
 
-## Acknowledgements
-If you find our work useful in your research or if you use parts of this code please cite our paper:
+全套 unittest 从根目录运行；`-t .` 防止 `tests/training` 遮蔽训练主包：
 
-```bibtext
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /data2/lama/miniconda3/envs/MIL/bin/python -m unittest discover -s tests -t . -v
+```
+
+STARPath 与旧默认 C 的 671 个 `state_dict` 键一致；受控同权重 CPU 对照中，关键前向张量和参数梯度最大绝对差均为 0。真实 TITAN 权重也已分别从两个目录加载并验证。这些结构与数值检查不代表已完成全部癌种的五折训练。
+
+更多说明：[STARPath 架构](docs/starpath_architecture.md)、[模型来源](docs/model_provenance.md)、[数据与划分](docs/data_and_splits.md)、[原型协议](docs/prototypes.md)、[工具用途](docs/tools.md)。
+
+本仓库保留 MMP 作者归属及原始 [LICENSE.md](LICENSE.md)（CC BY-NC-SA 4.0）。第三方模型和资源按各自上游条款提供，详见模型来源文档。使用 MMP 方法或相关代码时请引用：
+
+```bibtex
 @inproceedings{song2024multimodal,
   title={Multimodal Prototyping for cancer survival prediction},
   author={Song, Andrew H and Chen, Richard J and Jaume, Guillaume and Vaidya, Anurag Jayant and Baras, Alexander and Mahmood, Faisal},
@@ -153,11 +166,3 @@ If you find our work useful in your research or if you use parts of this code pl
   year={2024}
 }
 ```
-
-The code for **MMP** was adapted and inspired by the fantastic works of [PANTHER](https://openaccess.thecvf.com/content/CVPR2024/html/Song_Morphological_Prototyping_for_Unsupervised_Slide_Representation_Learning_in_Computational_Pathology_CVPR_2024_paper.html), [SurvPath](https://github.com/mahmoodlab/SurvPath) and [CLAM](https://github.com/mahmoodlab/CLAM). Boilerplate code for setting up supervised MIL benchmarks was developed by Ming Y. Lu and Tong Ding.
-
-## Issues 
-- Please open new threads or report issues directly (for urgent blockers) to `asong@bwh.harvard.edu`.
-- Immediate response to minor issues may not be available.
-
-<img src=docs/joint_logo.png> 

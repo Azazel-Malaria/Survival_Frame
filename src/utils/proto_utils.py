@@ -2,7 +2,6 @@
 All the functions related to clustering and slide embedding construction
 """
 
-import pdb
 import os
 from utils.file_utils import save_pkl, load_pkl
 import numpy as np
@@ -14,7 +13,7 @@ import torch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def cluster(data_loader, n_proto, n_iter, n_init=5, feature_dim=1024, n_proto_patches=50000, mode='kmeans', use_cuda=False):
+def cluster(data_loader, n_proto, n_iter, n_init=5, feature_dim=1024, n_proto_patches=50000, mode='kmeans', use_cuda=False, seed=1):
     """
     K-Means clustering on embedding space
 
@@ -26,10 +25,9 @@ def cluster(data_loader, n_proto, n_iter, n_init=5, feature_dim=1024, n_proto_pa
     n_total = n_proto * n_proto_patches
 
     # Sample equal number of patch features from each WSI
-    try:
-        n_patches_per_batch = (n_total + len(data_loader) - 1) // len(data_loader)
-    except:
-        n_patches_per_batch = 1000
+    if len(data_loader) == 0:
+        raise ValueError('Prototype clustering requires non-empty training slides')
+    n_patches_per_batch = (n_total + len(data_loader) - 1) // len(data_loader)
 
     print(f"Sampling maximum of {n_proto * n_proto_patches} patches: {n_patches_per_batch} each from {len(data_loader)}")
 
@@ -37,14 +35,16 @@ def cluster(data_loader, n_proto, n_iter, n_init=5, feature_dim=1024, n_proto_pa
 
     for batch in tqdm(data_loader):
         if n_patches >= n_total:
-            continue
+            break
 
         data = batch['img'] # (n_batch, n_instances, instance_dim)
 
         with torch.no_grad():
             data_reshaped = data.reshape(-1, data.shape[-1])
-            np.random.shuffle(data_reshaped)
-            out = data_reshaped[:n_patches_per_batch]  # Remove batch dim
+            if data_reshaped.shape[1] != feature_dim or not torch.isfinite(data_reshaped).all():
+                raise ValueError('Prototype features must be finite and match in_dim')
+            sample_order = torch.randperm(data_reshaped.shape[0])
+            out = data_reshaped[sample_order[:n_patches_per_batch]]  # Remove batch dim
 
         size = out.size(0)
         if n_patches + size > n_total:
@@ -54,12 +54,14 @@ def cluster(data_loader, n_proto, n_iter, n_init=5, feature_dim=1024, n_proto_pa
         n_patches += size
 
     print(f"\nTotal of {n_patches} patches aggregated")
+    if n_patches < n_proto:
+        raise ValueError(f'Only {n_patches} training patches for {n_proto} prototypes')
 
     s = time.time()
     if mode == 'kmeans':
         print("\nUsing Kmeans for clustering...")
         print(f"\n\tNum of clusters {n_proto}, num of iter {n_iter}")
-        kmeans = KMeans(n_clusters=n_proto, max_iter=n_iter)
+        kmeans = KMeans(n_clusters=n_proto, max_iter=n_iter, n_init=n_init, random_state=seed)
         kmeans.fit(patches[:n_patches].cpu())
         weight = kmeans.cluster_centers_[np.newaxis, ...]
 
@@ -81,9 +83,10 @@ def cluster(data_loader, n_proto, n_iter, n_init=5, feature_dim=1024, n_proto_pa
                               nredo=n_init,
                               verbose=True, 
                               max_points_per_centroid=n_proto_patches,
+                              seed=seed,
                               gpu=numOfGPUs)
         
-        kmeans.train(patches.numpy())
+        kmeans.train(patches[:n_patches].numpy())
         weight = kmeans.centroids[np.newaxis, ...]
 
     else:
@@ -111,4 +114,3 @@ def check_prototypes(n_proto, embed_dim, load_proto, proto_path):
                                                                                            embed_dim,
                                                                                            prototypes.shape[0],
                                                                                            prototypes.shape[1])
-

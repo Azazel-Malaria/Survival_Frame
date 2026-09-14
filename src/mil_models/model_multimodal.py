@@ -66,7 +66,8 @@ class OT_Attn(nn.Module):
         """
 
         if self.impl == "pot-uot-l2":
-            a, b = torch.tensor(ot.unif(weight1.size()[0])).cuda(), torch.tensor(ot.unif(weight2.size()[0])).cuda()
+            a = torch.tensor(ot.unif(weight1.size()[0]), device=weight1.device)
+            b = torch.tensor(ot.unif(weight2.size()[0]), device=weight2.device)
             self.cost_map = torch.cdist(weight1, weight2) ** 2  # (N, M)
 
             cost_map_detach = self.cost_map
